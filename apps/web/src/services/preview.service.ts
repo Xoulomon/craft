@@ -162,93 +162,165 @@ export function generatePreviewCss(config: CustomizationConfig): string {
 // ── PreviewService ────────────────────────────────────────────────────────────
 
 export class PreviewService {
-  /**
-   * Generate preview data for a given customisation config and viewport.
-   *
-   * Invariants (Properties 13 & 14):
-   *   - mockData is always STATIC_MOCK_DATA — no network I/O occurs.
-   *   - The same (config, viewport) pair always produces structurally
-   *     identical output (deterministic).
-   *   - All three viewport classes produce valid, non-null PreviewData.
-   */
-  generatePreview(
-    config: CustomizationConfig,
-    viewportClass: ViewportClass = 'desktop'
-  ): PreviewData {
-    return {
-      css: generatePreviewCss(config),
-      viewport: VIEWPORT_DIMENSIONS[viewportClass],
-      mockData: STATIC_MOCK_DATA,
-      branding: {
-        appName: config.branding.appName,
-        primaryColor: config.branding.primaryColor,
-        secondaryColor: config.branding.secondaryColor,
-        fontFamily: config.branding.fontFamily,
-        logoUrl: config.branding.logoUrl,
-      },
-      features: { ...config.features },
-    };
-  }
+    private templateCategory?: TemplateCategory;
 
-  /**
-   * Generate preview data for all supported viewport classes at once.
-   * Useful for responsive regression checks.
-   */
-  generateAllViewports(
-    config: CustomizationConfig
-  ): Record<ViewportClass, PreviewData> {
-    return {
-      desktop: this.generatePreview(config, 'desktop'),
-      tablet: this.generatePreview(config, 'tablet'),
-      mobile: this.generatePreview(config, 'mobile'),
-    };
-  }
+    /**
+     * Set template category for context-specific mock data generation.
+     */
+    setTemplateCategory(category?: TemplateCategory): void {
+        this.templateCategory = category;
+    }
 
-  /**
-   * Apply a partial update to an existing config and return a diff-aware result.
-   * Reports which fields changed.
-   */
-  applyUpdate(
-    current: CustomizationConfig,
-    patch: Partial<CustomizationConfig>
-  ): {
-    previous: CustomizationConfig;
-    updated: CustomizationConfig;
-    changedFields: string[];
-  } {
-    const updated: CustomizationConfig = {
-      branding: {
-        ...current.branding,
-        ...(patch.branding ?? {}),
-      },
-      features: {
-        ...current.features,
-        ...(patch.features ?? {}),
-      },
-      stellar: {
-        ...current.stellar,
-        ...(patch.stellar ?? {}),
-      },
-    };
+    /**
+     * Generate a full preview config for a template, optionally overlaying a
+     * saved customization. No network access is required — all data is passed in.
+     */
+    generatePreview(
+        template: Template,
+        savedConfig?: Partial<CustomizationConfig> | null
+    ): PreviewConfig {
+        const base = buildDefaultConfigFromTemplate(template);
+        const merged = normalizeDraftConfig(
+            savedConfig
+                ? {
+                      branding: { ...base.branding, ...(savedConfig.branding ?? {}) },
+                      features: { ...base.features, ...(savedConfig.features ?? {}) },
+                      stellar: { ...base.stellar, ...(savedConfig.stellar ?? {}) },
+                  }
+                : base
+        );
 
-    const changedFields: string[] = [];
-    const sections = ['branding', 'features', 'stellar'] as const;
-    for (const section of sections) {
-      const prev = current[section] as unknown as Record<string, unknown>;
-      const next = updated[section] as unknown as Record<string, unknown>;
-      for (const key of [...Object.keys(prev), ...Object.keys(next)]) {
-        if (JSON.stringify(prev[key]) !== JSON.stringify(next[key])) {
-          changedFields.push(`${section}.${key}`);
+        const validation = validateCustomizationConfig(merged);
+
+        const enabledFeatures: string[] = [];
+        const disabledFeatures: string[] = [];
+        for (const key of Object.keys(merged.features)) {
+            const val = (merged.features as unknown as Record<string, boolean>)[key];
+            if (val === true) {
+                enabledFeatures.push(key);
+            } else {
+                disabledFeatures.push(key);
+            }
         }
       }
     }
 
-    return {
-      previous: current,
-      updated,
-      changedFields,
-    };
-  }
+    /**
+     * Update preview with partial customization changes.
+     * Detects changed fields and only regenerates mock data if network config changed.
+     * Returns minimal update payload for efficient iframe updates.
+     */
+    updatePreview(
+        currentCustomization: CustomizationConfig,
+        changes: DeepPartial<CustomizationConfig>
+    ): { customization: CustomizationConfig; mockData?: StellarMockData; changedFields: string[]; timestamp: string } {
+        const updatedCustomization = this.mergeCustomization(currentCustomization, changes);
+        const changedFields = this.detectChangedFields(currentCustomization, changes);
+        const requiresMockDataRefresh = this.requiresMockDataRefresh(changedFields);
+
+        const payload: any = {
+            customization: updatedCustomization,
+            changedFields,
+            timestamp: new Date().toISOString(),
+        };
+
+        if (requiresMockDataRefresh) {
+            payload.mockData = this.generateMockData(updatedCustomization);
+        }
+
+        return payload;
+    }
+
+    /**
+     * Deep merge partial changes into current customization.
+     */
+    private mergeCustomization(
+        current: CustomizationConfig,
+        changes: DeepPartial<CustomizationConfig>
+    ): CustomizationConfig {
+        return {
+            branding: { ...current.branding, ...(changes.branding ?? {}) },
+            features: { ...current.features, ...(changes.features ?? {}) },
+            stellar: { ...current.stellar, ...(changes.stellar ?? {}) },
+        };
+    }
+
+    /**
+     * Detect which fields changed by comparing current and changes.
+     * Returns array of dot-notation field paths (e.g., "branding.appName").
+     */
+    private detectChangedFields(
+        current: CustomizationConfig,
+        changes: DeepPartial<CustomizationConfig>
+    ): string[] {
+        const fields: string[] = [];
+
+        if (changes.branding) {
+            Object.keys(changes.branding).forEach((key) => {
+                const currentVal = (current.branding as any)[key];
+                const changeVal = (changes.branding as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`branding.${key}`);
+                }
+            });
+        }
+
+        if (changes.features) {
+            Object.keys(changes.features).forEach((key) => {
+                const currentVal = (current.features as any)[key];
+                const changeVal = (changes.features as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`features.${key}`);
+                }
+            });
+        }
+
+        if (changes.stellar) {
+            Object.keys(changes.stellar).forEach((key) => {
+                const currentVal = (current.stellar as any)[key];
+                const changeVal = (changes.stellar as any)[key];
+                if (currentVal !== changeVal) {
+                    fields.push(`stellar.${key}`);
+                }
+            });
+        }
+
+        return fields;
+    }
+
+    /**
+     * Determine if mock data needs to be regenerated.
+     * Only network changes require mock data refresh.
+     */
+    private requiresMockDataRefresh(changedFields: string[]): boolean {
+        return changedFields.some((field) => field.startsWith('stellar.network'));
+    }
+
+    /**
+     * Apply a partial update to an existing config and return a diff-aware result.
+     * Validates the resulting config and reports which fields changed.
+     */
+    applyUpdate(
+        current: CustomizationConfig,
+        patch: Partial<CustomizationConfig>
+    ): PreviewUpdateResult {
+        const updated = normalizeDraftConfig({
+            branding: { ...current.branding, ...(patch.branding ?? {}) },
+            features: { ...current.features, ...(patch.features ?? {}) },
+            stellar: { ...current.stellar, ...(patch.stellar ?? {}) },
+        });
+
+        const validation = validateCustomizationConfig(updated);
+        const changedFields = diffConfigs(current, updated);
+
+        return {
+            previous: current,
+            updated,
+            changedFields,
+            isValid: validation.valid,
+            validationErrors: validation.errors,
+        };
+    }
 }
 
 export const previewService = new PreviewService();
