@@ -11,6 +11,10 @@ vi.mock('@/lib/supabase/server', () => ({
     }),
 }));
 
+vi.mock('@/lib/stripe/pricing', () => ({
+    canConfigureCustomDomain: (tier: string) => tier === 'pro' || tier === 'enterprise',
+}));
+
 const fakeUser = { id: 'user-1', email: 'user@example.com' };
 const params = { id: 'dep-1' };
 
@@ -57,10 +61,26 @@ describe('GET /api/deployments/[id]/dns', () => {
         expect(res.status).toBe(403);
     });
 
-    it('returns 404 when the deployment is not found', async () => {
+    it('returns 403 with upgradeUrl for free-tier users', async () => {
+        mockFrom
+            .mockReturnValueOnce(makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]))
+            .mockReturnValueOnce(makeSupabaseQuery([{ data: { subscription_tier: 'free' }, error: null }]));
+        const { GET } = await import('./route');
+
+        const res = await GET(makeRequest(), { params });
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.upgradeUrl).toBe('/pricing');
+    });
+
+    it('returns 404 when the deployment is not found (pro user)', async () => {
         mockFrom
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]),
+            )
+            .mockReturnValueOnce(
+                makeSupabaseQuery([{ data: { subscription_tier: 'pro' }, error: null }]),
             )
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: null, error: { message: 'not found' } }]),
@@ -72,10 +92,13 @@ describe('GET /api/deployments/[id]/dns', () => {
         expect(res.status).toBe(404);
     });
 
-    it('returns 404 when no custom domain is configured', async () => {
+    it('returns 404 when no custom domain is configured (pro user)', async () => {
         mockFrom
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]),
+            )
+            .mockReturnValueOnce(
+                makeSupabaseQuery([{ data: { subscription_tier: 'pro' }, error: null }]),
             )
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { custom_domain: null }, error: null }]),
@@ -89,10 +112,13 @@ describe('GET /api/deployments/[id]/dns', () => {
         expect(body.error).toMatch(/no custom domain/i);
     });
 
-    it('returns 200 with DNS config for an apex domain', async () => {
+    it('returns 200 with DNS config for an apex domain (pro user)', async () => {
         mockFrom
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]),
+            )
+            .mockReturnValueOnce(
+                makeSupabaseQuery([{ data: { subscription_tier: 'pro' }, error: null }]),
             )
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { custom_domain: 'example.com' }, error: null }]),
@@ -110,10 +136,13 @@ describe('GET /api/deployments/[id]/dns', () => {
         expect(Array.isArray(body.notes)).toBe(true);
     });
 
-    it('returns 200 with a CNAME record for a subdomain', async () => {
+    it('returns 200 with a CNAME record for a subdomain (enterprise user)', async () => {
         mockFrom
             .mockReturnValueOnce(
                 makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]),
+            )
+            .mockReturnValueOnce(
+                makeSupabaseQuery([{ data: { subscription_tier: 'enterprise' }, error: null }]),
             )
             .mockReturnValueOnce(
                 makeSupabaseQuery([
@@ -127,5 +156,26 @@ describe('GET /api/deployments/[id]/dns', () => {
         expect(res.status).toBe(200);
         const body = await res.json();
         expect(body.records.some((r: { type: string }) => r.type === 'CNAME')).toBe(true);
+    });
+
+    it('returns 403 with upgrade prompt for free-tier users', async () => {
+        const { requireDomainTier } = await import('@/lib/api/require-domain-tier');
+        vi.mocked(requireDomainTier).mockResolvedValueOnce(
+            new Response(
+                JSON.stringify({ error: 'Custom domains require a Pro or Enterprise subscription.', requiredTier: 'pro', upgradeUrl: '/pricing' }),
+                { status: 403, headers: { 'Content-Type': 'application/json' } },
+            ) as unknown as import('next/server').NextResponse,
+        );
+        mockFrom.mockReturnValue(
+            makeSupabaseQuery([{ data: { user_id: fakeUser.id }, error: null }]),
+        );
+        const { GET } = await import('./route');
+
+        const res = await GET(makeRequest(), { params });
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.requiredTier).toBe('pro');
+        expect(body.upgradeUrl).toBe('/pricing');
     });
 });
